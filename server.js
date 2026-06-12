@@ -47,7 +47,7 @@ function extractHeadingPages(pdfPath) {
         const pages = stdout.split('\x0c');
         pages.forEach((pageText, idx) => {
           const pg = idx + 1;
-          const matches = pageText.matchAll(/@@HDR_([A-Z0-9]{1,4}[a-z]?(?:-\d+)?)@@/g);
+          const matches = pageText.matchAll(/@@HDR_(\d{1,2}[a-z]?|[A-Z]{1,2}-\d{1,2})@@/g);
           for (const m of matches) {
             if (!pageMap[m[1]]) {
               pageMap[m[1]] = pg;
@@ -69,20 +69,23 @@ async function patchDocx(docxBuf, pageMap) {
 
   // 1. Patch TOC page numbers: find last <w:t>\d+</w:t> in each TOC1 paragraph
   //    The ID is embedded earlier in the same paragraph as "<w:t>ID.</w:t>"
+  let patchCount = 0;
   xml = xml.replace(
-    /(<w:pStyle w:val="TOC1"\/>(?:(?!<\/w:p>)[\s\S])*?)(<w:r[^>]*><w:t[^>]*>)(\d+)(<\/w:t><\/w:r>)(<\/w:p>)/g,
-    (match, prefix, runOpen, currentNum, runClose, paraClose) => {
-      const idMatch = prefix.match(/<w:t[^>]*>([A-Z]{0,2}\d{1,2}[a-z]?(?:-\d+)?)\.<\/w:t>/);
-      if (!idMatch) return match;
+    /(<w:pStyle w:val="TOC1"\/>(?:(?!<\/w:p>)[\s\S])*?)(<w:t[^>]*>)(\d+)(<\/w:t><\/w:r><\/w:p>)/g,
+    (match, prefix, tOpen, currentNum, tail) => {
+      const idMatch = prefix.match(/<w:t[^>]*>(\d{1,2}[a-z]?|[A-Z]{1,2}-\d{1,2})\.<\/w:t>/);
+      if (!idMatch) { console.warn('[patch] no ID found in a TOC paragraph'); return match; }
       const realPage = pageMap[idMatch[1]];
       if (!realPage) { console.warn('[patch] no page for', idMatch[1]); return match; }
+      patchCount++;
       console.log(`[patch] TOC ${idMatch[1]}: ${currentNum} -> ${realPage}`);
-      return prefix + runOpen + realPage + runClose + paraClose;
+      return prefix + tOpen + realPage + tail;
     }
   );
+  console.log(`[patch] patched ${patchCount} TOC entries`);
 
   // 2. Strip the invisible anchor runs so they don't appear in final PDF
-  xml = xml.replace(/@@HDR_[A-Z0-9]{1,4}[a-z]?(?:-\d+)?@@/g, '');
+  xml = xml.replace(/@@HDR_(?:\d{1,2}[a-z]?|[A-Z]{1,2}-\d{1,2})@@/g, '');
 
   zip.file('word/document.xml', xml);
   return zip.generateAsync({ type: 'nodebuffer' });
