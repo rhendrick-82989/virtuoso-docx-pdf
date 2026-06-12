@@ -1,6 +1,6 @@
 const express   = require('express');
 const multer    = require('multer');
-const { exec, execSync }  = require('child_process');
+const { exec }  = require('child_process');
 const fs        = require('fs');
 const path      = require('path');
 const crypto    = require('crypto');
@@ -35,69 +35,54 @@ function sofficeConvert(inPath, outDir) {
   });
 }
 
-// ── Extract heading → page map using pdftotext page-by-page ──────────────────
-// Returns { "1a": 3, "2a": 5, "M-1": 28, ... }
-async function extractHeadingPages(pdfPath) {
-  const pageMap = {};
+// ── Extract heading page numbers via invisible @@HDR_ID@@ anchors ────────────
+// The docx embeds white 1pt text anchors in each heading paragraph.
+// pdftotext reliably extracts these regardless of where the heading falls on the page.
+function extractHeadingPages(pdfPath) {
   return new Promise((resolve) => {
-    // Get total page count first
-    exec(`pdfinfo "${pdfPath}"`, { timeout: 10_000 }, (err, stdout) => {
-      if (err) { console.warn('pdfinfo failed:', err.message); return resolve(pageMap); }
-      const m = stdout.match(/Pages:\s+(\d+)/);
-      const totalPages = m ? parseInt(m[1]) : 0;
-      if (!totalPages) return resolve(pageMap);
-
-      let completed = 0;
-      for (let pg = 1; pg <= totalPages; pg++) {
-        const pgNum = pg;
-        exec(`pdftotext -f ${pgNum} -l ${pgNum} -layout "${pdfPath}" -`, 
-          { timeout: 10_000 },
-          (err2, text) => {
-            if (!err2 && text) {
-              text.split('\n').forEach(line => {
-                // Match "1a.   Title" or "M-1.  Title" or "AC-1.  Title"
-                const hm = line.trim().match(/^([A-Z]{0,2}\d{1,2}[a-z]?(?:-\d+)?)\.\s{2,}(.+)/);
-                if (hm && !pageMap[hm[1]]) {
-                  pageMap[hm[1]] = pgNum;
-                  console.log(`[pages] ${hm[1]} -> p${pgNum}`);
-                }
-              });
+    exec(`pdftotext -layout "${pdfPath}" -`, { timeout: 30_000, maxBuffer: 20 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) { console.warn('[pages] pdftotext failed:', err.message); return resolve({}); }
+        const pageMap = {};
+        const pages = stdout.split('\x0c');
+        pages.forEach((pageText, idx) => {
+          const pg = idx + 1;
+          const matches = pageText.matchAll(/@@HDR_([A-Z0-9]{1,4}[a-z]?(?:-\d+)?)@@/g);
+          for (const m of matches) {
+            if (!pageMap[m[1]]) {
+              pageMap[m[1]] = pg;
+              console.log(`[pages] ${m[1]} -> p${pg}`);
             }
-            completed++;
-            if (completed === totalPages) resolve(pageMap);
           }
-        );
+        });
+        console.log(`[pages] found ${Object.keys(pageMap).length} headings`);
+        resolve(pageMap);
       }
-    });
+    );
   });
 }
 
-// ── Patch TOC entries in docx XML with real page numbers ─────────────────────
-async function patchTocPageNumbers(docxBuf, pageMap) {
-  if (!Object.keys(pageMap).length) {
-    console.warn('[patch] empty page map — skipping');
-    return docxBuf;
-  }
-
+// ── Patch TOC entries + strip anchors from docx XML ──────────────────────────
+async function patchDocx(docxBuf, pageMap) {
   const zip = await new JSZip().loadAsync(docxBuf);
   let xml = await zip.file('word/document.xml').async('string');
 
-  // Each TOC entry paragraph has structure:
-  //   <w:t>ID.</w:t> ... <w:t>\tTitle\t</w:t> ... <w:t>1</w:t></w:p>
-  // Strategy: find the last <w:t> in each TOC1-styled paragraph and replace with real page num
+  // 1. Patch TOC page numbers: find last <w:t>\d+</w:t> in each TOC1 paragraph
+  //    The ID is embedded earlier in the same paragraph as "<w:t>ID.</w:t>"
   xml = xml.replace(
     /(<w:pStyle w:val="TOC1"\/>(?:(?!<\/w:p>)[\s\S])*?)(<w:r[^>]*><w:t[^>]*>)(\d+)(<\/w:t><\/w:r>)(<\/w:p>)/g,
     (match, prefix, runOpen, currentNum, runClose, paraClose) => {
-      // Extract the ID from earlier in the paragraph — find first <w:t> content
       const idMatch = prefix.match(/<w:t[^>]*>([A-Z]{0,2}\d{1,2}[a-z]?(?:-\d+)?)\.<\/w:t>/);
       if (!idMatch) return match;
-      const id = idMatch[1];
-      const realPage = pageMap[id];
-      if (!realPage) { console.warn('[patch] no page for', id); return match; }
-      console.log(`[patch] ${id}: ${currentNum} -> ${realPage}`);
+      const realPage = pageMap[idMatch[1]];
+      if (!realPage) { console.warn('[patch] no page for', idMatch[1]); return match; }
+      console.log(`[patch] TOC ${idMatch[1]}: ${currentNum} -> ${realPage}`);
       return prefix + runOpen + realPage + runClose + paraClose;
     }
   );
+
+  // 2. Strip the invisible anchor runs so they don't appear in final PDF
+  xml = xml.replace(/@@HDR_[A-Z0-9]{1,4}[a-z]?(?:-\d+)?@@/g, '');
 
   zip.file('word/document.xml', xml);
   return zip.generateAsync({ type: 'nodebuffer' });
@@ -117,24 +102,22 @@ app.post('/convert', upload.single('file'), async (req, res) => {
     const originalBuf = req.file.buffer;
     fs.writeFileSync(pass1In, originalBuf);
 
-    // ── Pass 1: convert to PDF to establish real page layout ─────────────
+    // Pass 1: convert to establish page layout
     console.log('[convert] pass 1...');
     await sofficeConvert(pass1In, tmpDir);
     const p1pdf = path.join(tmpDir, 'pass1.pdf');
-    if (!fs.existsSync(p1pdf)) throw new Error('Pass 1 conversion produced no PDF.');
+    if (!fs.existsSync(p1pdf)) throw new Error('Pass 1 produced no PDF.');
 
-    // ── Extract heading page numbers ──────────────────────────────────────
-    console.log('[convert] extracting page numbers...');
+    // Extract heading page numbers from anchors
     const pageMap = await extractHeadingPages(p1pdf);
-    console.log('[convert] found', Object.keys(pageMap).length, 'headings');
 
-    // ── Pass 2: patch TOC + reconvert ─────────────────────────────────────
+    // Pass 2: patch TOC + strip anchors, reconvert
     console.log('[convert] pass 2...');
-    const patched = await patchTocPageNumbers(originalBuf, pageMap);
+    const patched = await patchDocx(originalBuf, pageMap);
     fs.writeFileSync(pass2In, patched);
     await sofficeConvert(pass2In, tmpDir);
     const p2pdf = path.join(tmpDir, 'pass2.pdf');
-    if (!fs.existsSync(p2pdf)) throw new Error('Pass 2 conversion produced no PDF.');
+    if (!fs.existsSync(p2pdf)) throw new Error('Pass 2 produced no PDF.');
 
     const pdf = fs.readFileSync(p2pdf);
     res.setHeader('Content-Type', 'application/pdf');
