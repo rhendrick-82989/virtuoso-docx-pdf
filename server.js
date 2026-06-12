@@ -39,11 +39,56 @@ app.post('/convert', upload.single('file'), async (req, res) => {
     fs.mkdirSync(tmpDir, { recursive: true });
     fs.writeFileSync(inPath, req.file.buffer);
 
+    // Use a LibreOffice Basic macro to open the doc, update all fields (incl. TOC),
+    // then export to PDF — this ensures TOC page numbers are recalculated.
+    const macroScript = `
+import uno
+from com.sun.star.beans import PropertyValue
+
+def update_fields_and_export():
+    ctx = uno.getComponentContext()
+    smgr = ctx.ServiceManager
+    desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
+
+    url = uno.systemPathToFileUrl("${inPath}")
+    props = []
+    doc = desktop.loadComponentFromURL(url, "_blank", 0, props)
+
+    # Update all fields including TOC
+    doc.getTextFields().refresh()
+    try:
+        indexes = doc.getDocumentIndexes()
+        for i in range(indexes.Count):
+            indexes.getByIndex(i).update()
+    except:
+        pass
+
+    # Export to PDF
+    out_url = uno.systemPathToFileUrl("${outPath}")
+    pdf_props = [PropertyValue()]
+    pdf_props[0].Name = "FilterName"
+    pdf_props[0].Value = "writer_pdf_Export"
+    doc.storeToURL(out_url, tuple(pdf_props))
+    doc.close(True)
+
+update_fields_and_export()
+`.trim();
+
+    const macroPath = path.join(tmpDir, 'convert.py');
+    fs.writeFileSync(macroPath, macroScript);
+
     await new Promise((resolve, reject) => {
-      const cmd = `soffice --headless --convert-to pdf --outdir "${tmpDir}" "${inPath}"`;
-      exec(cmd, { timeout: 60_000, env: { ...process.env, HOME: tmpDir } }, (err, stdout, stderr) => {
-        if (err) return reject(new Error(stderr || err.message));
-        resolve();
+      // Try python-based UNO macro first; fall back to direct convert if it fails
+      const unoCmd = `python3 "${macroPath}"`;
+      const env = { ...process.env, HOME: tmpDir, PYTHONPATH: '/usr/lib/libreoffice/program' };
+      exec(unoCmd, { timeout: 60_000, env }, (err) => {
+        if (!err && fs.existsSync(outPath)) return resolve();
+        // Fallback: direct headless convert (TOC page numbers may all be 1)
+        const cmd = `soffice --headless --convert-to pdf --outdir "${tmpDir}" "${inPath}"`;
+        exec(cmd, { timeout: 60_000, env: { ...process.env, HOME: tmpDir } }, (err2, stdout, stderr) => {
+          if (err2) return reject(new Error(stderr || err2.message));
+          resolve();
+        });
       });
     });
 
