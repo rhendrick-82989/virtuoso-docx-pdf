@@ -63,7 +63,10 @@ function extractHeadingPages(pdfPath) {
 }
 
 // ── Patch TOC entries + strip anchors from docx XML ──────────────────────────
-async function patchDocx(docxBuf, pageMap) {
+// wrapField: additionally wrap the TOC entries in a live Word { TOC } field,
+// with the patched entries as the field's cached result. Word shows correct
+// page numbers immediately and the user can still right-click -> Update Field.
+async function patchDocx(docxBuf, pageMap, wrapField = false) {
   const zip = await new JSZip().loadAsync(docxBuf);
   let xml = await zip.file('word/document.xml').async('string');
 
@@ -86,6 +89,33 @@ async function patchDocx(docxBuf, pageMap) {
 
   // 2. Strip the invisible anchor runs so they don't appear in final PDF
   xml = xml.replace(/@@HDR_(?:\d{1,2}[a-z]?|[A-Z]{1,2}-\d{1,2})@@/g, '');
+
+  // 3. (Word output) Wrap the TOC entry block in a live { TOC } field.
+  //    Field begin + instruction + separate go into the FIRST TOC1 paragraph;
+  //    field end goes into the LAST TOC1 paragraph. The entries between become
+  //    the field's cached result.
+  if (wrapField) {
+    const tocParaRe = /<w:p><w:pPr>(?:(?!<\/w:pPr>)[\s\S])*?<w:pStyle w:val="TOC1"\/>(?:(?!<\/w:pPr>)[\s\S])*?<\/w:pPr>/g;
+    const matches = [...xml.matchAll(tocParaRe)];
+    if (matches.length > 0) {
+      const first = matches[0];
+      const fieldStart =
+        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>' +
+        '<w:r><w:instrText xml:space="preserve"> TOC \\o "1-1" \\h \\z \\u </w:instrText></w:r>' +
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>';
+      // Insert field start right after the first TOC1 paragraph's </w:pPr>
+      const firstEnd = first.index + first[0].length;
+      xml = xml.slice(0, firstEnd) + fieldStart + xml.slice(firstEnd);
+
+      // Find the LAST TOC1 paragraph (re-scan since xml shifted) and insert field end before its </w:p>
+      const all = [...xml.matchAll(/<w:pStyle w:val="TOC1"\/>/g)];
+      const lastStyleIdx = all[all.length - 1].index;
+      const lastParaClose = xml.indexOf('</w:p>', lastStyleIdx);
+      const fieldEnd = '<w:r><w:fldChar w:fldCharType="end"/></w:r>';
+      xml = xml.slice(0, lastParaClose) + fieldEnd + xml.slice(lastParaClose);
+      console.log('[patch] wrapped', matches.length, 'TOC entries in live { TOC } field');
+    }
+  }
 
   zip.file('word/document.xml', xml);
   return zip.generateAsync({ type: 'nodebuffer' });
@@ -113,6 +143,17 @@ app.post('/convert', upload.single('file'), async (req, res) => {
 
     // Extract heading page numbers from anchors
     const pageMap = await extractHeadingPages(p1pdf);
+
+    const wantDocx = req.query.output === 'docx';
+
+    if (wantDocx) {
+      // Word output: patch page numbers, wrap entries in a live { TOC } field, return docx
+      console.log('[convert] patching docx for Word output...');
+      const patched = await patchDocx(originalBuf, pageMap, true);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      res.setHeader('Content-Disposition', 'attachment; filename="DEN250054_Complete_Response.docx"');
+      return res.send(patched);
+    }
 
     // Pass 2: patch TOC + strip anchors, reconvert
     console.log('[convert] pass 2...');
