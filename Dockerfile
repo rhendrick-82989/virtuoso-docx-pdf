@@ -1,16 +1,16 @@
 FROM node:20-slim
 
-# Install LibreOffice headless + minimal font support
+# Install LibreOffice, poppler-utils (pdftotext), and fonts
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libreoffice \
       libreoffice-writer \
+      poppler-utils \
       fonts-liberation \
       fonts-dejavu \
       fontconfig \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Rebuild font cache
 RUN fc-cache -f -v
 
 WORKDIR /app
@@ -19,7 +19,6 @@ RUN npm install --omit=dev
 
 COPY server.js ./
 
-# LibreOffice needs a writable HOME; /tmp is always writable
 ENV HOME=/tmp
 
 EXPOSE 3001
